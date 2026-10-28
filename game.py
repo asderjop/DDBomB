@@ -10,11 +10,21 @@ Controles: flechas del teclado (izquierda, abajo, arriba, derecha).
 Soporte bilingüe: English / Español (seleccionable al inicio).
 """
 
+import collections
 import random
 import sys
 import math
 
 import pygame
+import pygame.mixer
+
+# Librosa is required for audio-synced beatmap generation.
+# Install with: pip install librosa
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
 
 # ----------------------------------------------------------------------------
 # Configuración general / General settings
@@ -34,6 +44,16 @@ GOOD_WINDOW = 75                    # Distancia (px) máxima para acertar
 ARROW_SIZE = 40
 
 START_LIVES = 3
+
+# Constant fall speed used for sync math (px/s).
+# Audio-synced mode uses this instead of the level-scaling value so that
+# travel_time is constant and predictable.
+SYNC_FALL_SPEED = 400
+
+# Default audio file.  Replace with your own song; must be a format pygame
+# can decode (ogg/mp3/wav).  If the file is missing, the game falls back to
+# random spawning so you can still play without audio.
+AUDIO_FILE = "bailando.mp3"
 
 # Dirección de cada carril: 0 izquierda, 1 abajo, 2 arriba, 3 derecha
 LANE_ANGLES = [270, 180, 0, 90]     # Ángulo de giro de una flecha "hacia arriba"
@@ -93,6 +113,7 @@ TEXTS = {
         "feedback_miss": "MISS!",
         "reason_bomb": "You pressed a bomb arrow!",
         "reason_lives": "You ran out of lives",
+        "reason_song_end": "Song finished!",
         "game_over_title": "GAME OVER",
         "game_over_final_score": "Final score: {score}",
         "game_over_best_score": "Best score: {best_score}",
@@ -123,6 +144,7 @@ TEXTS = {
         "feedback_miss": "¡FALLO!",
         "reason_bomb": "¡Has pulsado una flecha bomba!",
         "reason_lives": "Te has quedado sin vidas",
+        "reason_song_end": "¡Canción terminada!",
         "game_over_title": "FIN DEL JUEGO",
         "game_over_final_score": "Puntuación final: {score}",
         "game_over_best_score": "Mejor puntuación: {best_score}",
@@ -137,6 +159,50 @@ TEXTS = {
         "lang_hint_esc": "ESC: salir",
     },
 }
+
+
+# ----------------------------------------------------------------------------
+# Audio analysis / Análisis de audio
+# ----------------------------------------------------------------------------
+def generate_beatmap_from_audio(file_path, bomb_chance):
+    """Analyse *file_path* with librosa and return a deque of note dicts.
+
+    Each dict has the shape::
+
+        {"time": float,   # seconds from song start when the note should HIT TARGET_Y
+         "lane": int,     # 0-3
+         "bomb": bool}
+
+    If librosa is not installed or the file cannot be read, returns an empty
+    deque so the game can fall back to random spawning gracefully.
+    """
+    if not LIBROSA_AVAILABLE:
+        print("[beatmap] librosa not available – falling back to random spawning.")
+        return collections.deque()
+
+    try:
+        y, sr = librosa.load(file_path, mono=True)
+    except Exception as exc:
+        print(f"[beatmap] Could not load '{file_path}': {exc}")
+        return collections.deque()
+
+    # Detect onsets (backtrack=True snaps to the nearest preceding zero-crossing
+    # so the timestamp is as close to the true beat attack as possible).
+    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, backtrack=True)
+    onset_times = librosa.frames_to_time(onset_frames, sr=sr)
+
+    beatmap = collections.deque()
+    last_lane = -1
+    for t in onset_times:
+        # Pick a lane that is different from the previous one.
+        available = [l for l in range(NUM_LANES) if l != last_lane]
+        lane = random.choice(available)
+        last_lane = lane
+        is_bomb = random.random() < bomb_chance
+        beatmap.append({"time": float(t), "lane": lane, "bomb": is_bomb})
+
+    print(f"[beatmap] Generated {len(beatmap)} notes from '{file_path}'.")
+    return beatmap
 
 
 # ----------------------------------------------------------------------------
@@ -256,6 +322,10 @@ class Note:
 class Game:
     def __init__(self):
         pygame.init()
+
+        # Initialise the audio mixer before any display work.
+        pygame.mixer.init()
+
         pygame.display.set_caption("DDR Bomb")
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock = pygame.time.Clock()
@@ -273,18 +343,42 @@ class Game:
 
         self.best_score = 0
         self.time = 0.0
+
+        # Load the song and pre-generate the beatmap once so we don't repeat
+        # the (potentially slow) librosa analysis every restart.
+        self._audio_loaded = self._load_audio(AUDIO_FILE)
+        # Master copy; reset() clones this into the live queue each round.
+        self._master_beatmap = collections.deque()
+        if self._audio_loaded:
+            # bomb_chance is fixed at the starting level value for the initial
+            # analysis; the queue is rebuilt on reset() so it always starts fresh.
+            self._master_beatmap = generate_beatmap_from_audio(AUDIO_FILE, 0.14)
+
         self.reset()
 
-    def t(self, key, **kwargs):
-        """Retorna el texto en el idioma seleccionado según la clave."""
-        lang_dict = TEXTS.get(self.lang, TEXTS["en"])
-        val = lang_dict.get(key, key)
-        if kwargs:
-            try:
-                return val.format(**kwargs)
-            except Exception:
-                return val
-        return val
+    # ---------------------------------------------------------------- audio
+    def _load_audio(self, path):
+        """Try to load *path* into pygame.mixer.  Returns True on success."""
+        try:
+            pygame.mixer.music.load(path)
+            return True
+        except Exception as exc:
+            print(f"[audio] Could not load '{path}': {exc} – falling back to random spawning.")
+            return False
+
+    def _start_music(self):
+        """Begin playback from the start of the track."""
+        if self._audio_loaded:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.play()
+
+    def _current_audio_time(self):
+        """Return the current playback position in seconds (0.0 if not playing)."""
+        pos_ms = pygame.mixer.music.get_pos()
+        if pos_ms < 0:
+            # get_pos() returns -1 when no music is playing.
+            return -1.0
+        return pos_ms / 1000.0
 
     # ------------------------------------------------------------------ estado
     def reset(self):
@@ -295,7 +389,6 @@ class Game:
         self.lives = START_LIVES
         self.resolved = 0            # notas resueltas (aciertos + fallos + bombas esquivadas)
         self.level = 1
-        self.spawn_timer = 1.0
         self.last_lane = -1
         self.lane_flash = [0.0] * NUM_LANES
         self.feedback_text = ""
@@ -306,17 +399,24 @@ class Game:
         self.avatar_mood = "neutral"
         self.avatar_timer = 0.0
 
+        # Audio-sync state -------------------------------------------------
+        # Clone the master beatmap into a fresh deque for this round.
+        self.beatmap_queue = collections.deque(self._master_beatmap)
+
+        # Fallback random-spawn state (used when no audio beatmap is available).
+        self.spawn_timer = 1.0
+
     def set_avatar(self, mood, duration):
         """Cambia el estado de ánimo del avatar durante 'duration' segundos."""
         self.avatar_mood = mood
         self.avatar_timer = duration
 
     def fall_speed(self):
-        """Velocidad de caída (px/s): aumenta con el nivel."""
+        """Velocidad de caída (px/s): increases with level (random-spawn mode)."""
         return min(260 + 45 * (self.level - 1), 820)
 
     def spawn_interval(self):
-        """Tiempo entre flechas (s): disminuye con el nivel."""
+        """Tiempo entre flechas (s): disminuye con el nivel (random-spawn fallback)."""
         return max(0.28, 0.85 - 0.06 * (self.level - 1))
 
     def bomb_chance(self):
@@ -332,7 +432,8 @@ class Game:
         self.feedback_timer = 0.6
 
     # ------------------------------------------------------------------ lógica
-    def spawn_notes(self):
+    def _spawn_random_note(self):
+        """Legacy random-spawn used when no audio beatmap is present."""
         lane = random.choice([l for l in range(NUM_LANES) if l != self.last_lane])
         self.last_lane = lane
         self.notes.append(Note(lane, random.random() < self.bomb_chance()))
@@ -387,7 +488,20 @@ class Game:
         self.death_reason_key = reason_key
         self.best_score = max(self.best_score, self.score)
         self.set_avatar("sad", 0.0)      # Triste de forma permanente en el fin de partida
+        if self._audio_loaded:
+            pygame.mixer.music.stop()
         self.state = STATE_GAME_OVER
+
+    def t(self, key, **kwargs):
+        """Retorna el texto en el idioma seleccionado según la clave."""
+        lang_dict = TEXTS.get(self.lang, TEXTS["en"])
+        val = lang_dict.get(key, key)
+        if kwargs:
+            try:
+                return val.format(**kwargs)
+            except Exception:
+                return val
+        return val
 
     def update(self, dt):
         self.time += dt
@@ -407,14 +521,49 @@ class Game:
         if self.state != STATE_PLAYING:
             return
 
-        # Aparición de flechas
-        self.spawn_timer -= dt
-        if self.spawn_timer <= 0:
-            self.spawn_notes()
-            self.spawn_timer = self.spawn_interval()
+        # ------------------------------------------------------------------
+        # Note spawning
+        # ------------------------------------------------------------------
+        if self.beatmap_queue:
+            # ---- Audio-synchronised spawning ----
+            # Travel distance: from the spawn Y to TARGET_Y.
+            travel_distance = TARGET_Y - (-ARROW_SIZE * 1.5)
+            # Time the note takes to travel that distance at constant speed.
+            travel_time = travel_distance / SYNC_FALL_SPEED
+            # Current playback position in seconds.
+            current_audio_time = self._current_audio_time()
 
-        # Movimiento y fallos
-        speed = self.fall_speed()
+            # Spawn notes whose scheduled hit-time is now within travel_time.
+            while self.beatmap_queue:
+                next_note = self.beatmap_queue[0]
+                spawn_trigger_time = next_note["time"] - travel_time
+                if current_audio_time >= spawn_trigger_time:
+                    self.beatmap_queue.popleft()
+                    note = Note(next_note["lane"], next_note["bomb"])
+                    # Correct sub-frame timing: offset the starting Y so the
+                    # note arrives at TARGET_Y at exactly the right moment.
+                    time_error = current_audio_time - spawn_trigger_time
+                    note.y += time_error * SYNC_FALL_SPEED
+                    self.notes.append(note)
+                else:
+                    break  # Queue is time-ordered; no point checking further.
+
+            # Detect song end: mixer stopped and beatmap exhausted.
+            if not pygame.mixer.music.get_busy() and not self.beatmap_queue and not self.notes:
+                self.end_game("reason_song_end")
+                return
+
+        else:
+            # ---- Fallback: random time-based spawning ----
+            self.spawn_timer -= dt
+            if self.spawn_timer <= 0:
+                self._spawn_random_note()
+                self.spawn_timer = self.spawn_interval()
+
+        # ------------------------------------------------------------------
+        # Note movement and miss detection
+        # ------------------------------------------------------------------
+        speed = SYNC_FALL_SPEED if self.beatmap_queue or self._audio_loaded else self.fall_speed()
         for note in self.notes[:]:
             note.y += speed * dt
             if note.y > TARGET_Y + GOOD_WINDOW:
@@ -674,6 +823,7 @@ class Game:
                     else:
                         self.reset()
                         self.state = STATE_PLAYING
+                        self._start_music()          # ← start playback on game start
                 elif self.state == STATE_PLAYING:
                     if event.key in KEY_TO_LANE:
                         self.press_lane(KEY_TO_LANE[event.key])
@@ -681,6 +831,7 @@ class Game:
                     if event.key in (pygame.K_RETURN, pygame.K_SPACE):
                         self.reset()
                         self.state = STATE_PLAYING
+                        self._start_music()          # ← restart playback on replay
                     elif event.key == pygame.K_l:
                         self.state = STATE_LANGUAGE
 
