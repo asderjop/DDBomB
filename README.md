@@ -101,6 +101,7 @@ AUDIO_FILE = "your_song.ogg"   # ← set your filename here
 DDBomB/
 ├── game.py          # All game logic, rendering, and audio analysis
 ├── bailando.mp3     # Default bundled song (replace or keep)
+├── LICENSE.md       # PolyForm Noncommercial License 1.0.0
 └── README.md        # This file
 ```
 
@@ -185,7 +186,14 @@ pip install pygame librosa
 
 ## 📄 License
 
-This project is open source. Feel free to fork, remix, and build on it.
+This project is licensed under the **[PolyForm Noncommercial License 1.0.0](LICENSE.md)**.
+
+**TL;DR:**
+- ✅ Free to use, study, modify, and share
+- ✅ Open for personal projects, education, research, and hobby use
+- ❌ **Commercial use is strictly prohibited** — you may not sell this software, include it in a paid product, or use it in any way that generates revenue
+
+See [LICENSE.md](LICENSE.md) for the full legal text.
 
 ---
 
